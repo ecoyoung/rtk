@@ -91,10 +91,6 @@ static TEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
 static TEST_RUN_FOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*Test run for\s+(?P<dll>[^\r\n(]*\.dll)").expect("valid regex")
 });
-static TEST_SUMMARY_DLL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(?:Passed!|Failed!)\b[^\r\n]*-\s*(?P<dll>[^\r\n]*\.dll)\s*$")
-        .expect("valid regex")
-});
 static FAILED_TEST_HEAD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*Failed\s+(?P<name>[^\r\n\[]+)\s+\[[^\]\r\n]+\]\s*$").expect("valid regex")
 });
@@ -1053,17 +1049,13 @@ pub fn parse_restore_issues_from_text(text: &str) -> (Vec<BinlogIssue>, Vec<Binl
 }
 
 fn count_projects(text: &str) -> usize {
-    // Distinct test projects, not matching lines: a restore warning names the project's .csproj,
-    // so one project mentioned by two warnings used to count as two (#4844). Prefer the
-    // per-project DLL from the `Test run for` / `Passed! - … - dll` lines; SDKs that print
-    // neither still get the DISTINCT .csproj paths.
+    // Count test projects, not lines that mention one: restore warnings name a project's .csproj
+    // once per warning. Each test assembly the run executes prints one `Test run for <dll>` line
+    // with its full path, so those lines are counted when present. Output without them falls
+    // back to the distinct lines naming a .csproj, keyed by the line up to its last `.csproj`
+    // (`Restored <path>` and `<path> : warning` count apart).
     let mut projects: HashSet<&str> = HashSet::new();
     for captures in TEST_RUN_FOR_RE.captures_iter(text) {
-        if let Some(dll) = captures.name("dll") {
-            projects.insert(dll.as_str());
-        }
-    }
-    for captures in TEST_SUMMARY_DLL_RE.captures_iter(text) {
         if let Some(dll) = captures.name("dll") {
             projects.insert(dll.as_str());
         }
@@ -1379,8 +1371,8 @@ Time Elapsed 00:00:12.34
 
     #[test]
     fn test_parse_test_from_text_counts_distinct_projects_despite_warnings() {
-        // Real `dotnet test` shape (.NET 10): two test projects, each named by two restore
-        // warnings (NU1900). The warnings name the .csproj, but each project is ONE project
+        // Hand-written after the `dotnet test` shape (.NET 10): two test projects, each named by
+        // two restore warnings (NU1900). The warnings name the .csproj, but each project is ONE project
         // (#4844) — the count must not grow with every line that mentions the path.
         let input = r#"
 /work/A.Tests.csproj : warning NU1900: Unable to find package 'Coverlet.Collector'. No sets of versions.
@@ -1406,9 +1398,26 @@ Passed! - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 
     }
 
     #[test]
+    fn test_parse_test_from_text_counts_test_projects_not_referenced_libraries() {
+        // `dotnet test -v q` (.NET 10.0.400) on a solution with two test projects and a library
+        // they reference: restore warnings name all three .csproj files, but only the two test
+        // projects run, so the count comes from the `Test run for` lines.
+        let input =
+            include_str!("../../../tests/fixtures/dotnet/test_library_restore_warnings.txt");
+
+        let summary = parse_test_from_text(input);
+
+        assert_eq!(summary.passed, 3);
+        assert_eq!(
+            summary.project_count, 2,
+            "a referenced library named by restore warnings is not a test project"
+        );
+    }
+
+    #[test]
     fn test_parse_test_from_text_counts_distinct_csprojs_without_run_lines() {
-        // Older SDKs print neither a `Test run for` line nor a per-project `Passed! - … - dll`
-        // summary. Distinct .csproj paths still count — but a project named twice is one project.
+        // Output without `Test run for` lines counts the distinct lines naming a .csproj, so a
+        // project named twice is one project.
         let input = r#"
 /work/A.Tests.csproj : warning NU1900: Unable to find package 'Coverlet.Collector'. No sets of versions.
 /work/A.Tests.csproj : warning NU1900: Unable to find package 'Microsoft.NET.Test.Sdk'. No sets of versions.
