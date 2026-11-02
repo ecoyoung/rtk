@@ -1050,10 +1050,11 @@ pub fn parse_restore_issues_from_text(text: &str) -> (Vec<BinlogIssue>, Vec<Binl
 
 fn count_projects(text: &str) -> usize {
     // Count test projects, not lines that mention one: restore warnings name a project's .csproj
-    // once per warning. Each test assembly the run executes prints one `Test run for <dll>` line
-    // with its full path, so those lines are counted when present. Output without them falls
-    // back to the distinct lines naming a .csproj, keyed by the line up to its last `.csproj`
-    // (`Restored <path>` and `<path> : warning` count apart).
+    // once per warning, and a fresh restore names it again in a `Restored <csproj>` line. Each
+    // test assembly the run executes prints one `Test run for <dll>` line with its full path, so
+    // those lines are counted when present. Output without them falls back to the DISTINCT lines
+    // naming a .csproj, keyed by the path token — `Restored <path> (in 1.2 sec).` and
+    // `<path> : warning NU1900: …` name the same project once (#4844; the keying #4846 uses).
     let mut projects: HashSet<&str> = HashSet::new();
     for captures in TEST_RUN_FOR_RE.captures_iter(text) {
         if let Some(dll) = captures.name("dll") {
@@ -1065,8 +1066,13 @@ fn count_projects(text: &str) -> usize {
     }
     let mut csprojs: HashSet<&str> = HashSet::new();
     for captures in PROJECT_PATH_RE.captures_iter(text) {
-        if let Some(matched) = captures.get(0) {
-            csprojs.insert(matched.as_str().trim());
+        // The path is the last whitespace-separated token of the match: the line's leading
+        // `Restored ` / leading whitespace stay behind the token.
+        if let Some(path) = captures
+            .get(0)
+            .and_then(|m| m.as_str().split_whitespace().last())
+        {
+            csprojs.insert(path);
         }
     }
     csprojs.len()
@@ -1412,6 +1418,17 @@ Passed! - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 
             summary.project_count, 2,
             "a referenced library named by restore warnings is not a test project"
         );
+    }
+
+    #[test]
+    fn test_parse_test_from_text_counts_distinct_projects_across_restore_and_warning_lines() {
+        // Real `dotnet build` output on a fresh restore of a 3-project solution with NU1900 audit
+        // warnings: every project is named by a `Restored <csproj>` line AND by warning lines. The
+        // fallback counts DISTINCT project paths (#4844; the keying #4846 uses).
+        let input =
+            include_str!("../../../tests/fixtures/dotnet/fresh_restore_nu1900_warnings.txt");
+        let summary = parse_test_from_text(input);
+        assert_eq!(summary.project_count, 3);
     }
 
     #[test]
